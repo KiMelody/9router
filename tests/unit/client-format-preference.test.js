@@ -1,19 +1,25 @@
 /**
- * Unit tests for client-preference → endpoint routing.
+ * Unit + integration tests for client-preference → endpoint routing.
  *
- * Covers the decision chain introduced for "route by CLI client":
- *   clientTool → getClientPreferredFormat → getModelSupportedFormats → targetFormat → endpoint
- *
- * Tested at three layers:
- *   1. Pure helpers (getClientPreferredFormat, getModelSupportedFormats)
- *   2. The targetFormat decision rule (mirrors chatCore.js inline logic)
- *   3. OpenCodeGoExecutor endpoint/auth selection by resolved targetFormat
+ * The decision logic is exercised against the REAL resolveTargetFormat
+ * (the same function chatCore.js calls), not a local copy. The
+ * execute → buildUrl → fetch chain is verified by mocking proxyAwareFetch
+ * and asserting the fetched URL end-to-end.
  */
 
-import { describe, it, expect } from "vitest";
-import { getClientPreferredFormat } from "open-sse/utils/clientDetector.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+
+// Mock the network layer so executor.execute() runs without real I/O.
+// proxyFetch captures `globalThis.fetch` at module load, so we mock the whole
+// module to avoid that stale-capture problem.
+vi.mock("open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch: vi.fn(async () => ({ ok: true, status: 200 })),
+}));
+
+import { getClientPreferredFormat, resolveTargetFormat } from "open-sse/utils/clientDetector.js";
 import { getModelSupportedFormats, PROVIDER_ID_TO_ALIAS } from "open-sse/config/providerModels.js";
 import { OpenCodeGoExecutor } from "open-sse/executors/opencode-go.js";
+import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 
 const OC_GO = PROVIDER_ID_TO_ALIAS["opencode-go"]; // === "opencode-go" (no alias override)
 
@@ -53,15 +59,60 @@ describe("getModelSupportedFormats (opencode-go)", () => {
     expect(getModelSupportedFormats(OC_GO, "glm-5.1")).toBeNull();
     expect(getModelSupportedFormats(OC_GO, "mimo-v2-pro")).toBeNull();
   });
+
+  it("returns null for unknown alias / model", () => {
+    expect(getModelSupportedFormats("no-such-provider", "x")).toBeNull();
+    expect(getModelSupportedFormats(OC_GO, "no-such-model")).toBeNull();
+  });
 });
 
-// Mirror of chatCore.js targetFormat decision (soft-preference with fallback).
-function resolveTargetFormat(preferred, supported, modelDefault, providerDefault) {
-  if (preferred && supported?.includes(preferred)) return preferred;
-  return modelDefault || providerDefault;
-}
+// Directly test the REAL resolveTargetFormat across all branches.
+describe("resolveTargetFormat (real function, all branches)", () => {
+  it("returns preferred when model declares support", () => {
+    expect(resolveTargetFormat({
+      preferredFormat: "claude", supportedFormats: ["openai", "claude"],
+      modelTargetFormat: null, providerDefault: "openai",
+    })).toBe("claude");
+  });
 
-describe("targetFormat decision matrix", () => {
+  it("falls back when preferred is not in supportedFormats", () => {
+    expect(resolveTargetFormat({
+      preferredFormat: "openai-responses", supportedFormats: ["openai", "claude"],
+      modelTargetFormat: null, providerDefault: "openai",
+    })).toBe("openai");
+  });
+
+  it("falls back when supportedFormats is null (undeclared)", () => {
+    expect(resolveTargetFormat({
+      preferredFormat: "claude", supportedFormats: null,
+      modelTargetFormat: null, providerDefault: "openai",
+    })).toBe("openai");
+  });
+
+  it("falls back when preferredFormat is null (no client preference)", () => {
+    expect(resolveTargetFormat({
+      preferredFormat: null, supportedFormats: ["openai", "claude"],
+      modelTargetFormat: null, providerDefault: "openai",
+    })).toBe("openai");
+  });
+
+  it("prefers modelTargetFormat over providerDefault on fallback", () => {
+    expect(resolveTargetFormat({
+      preferredFormat: null, supportedFormats: null,
+      modelTargetFormat: "claude", providerDefault: "openai",
+    })).toBe("claude");
+  });
+
+  it("uses providerDefault when modelTargetFormat is also null", () => {
+    expect(resolveTargetFormat({
+      preferredFormat: null, supportedFormats: null,
+      modelTargetFormat: null, providerDefault: "gemini",
+    })).toBe("gemini");
+  });
+});
+
+// End-to-end decision per (client × opencode-go model), using the real helpers.
+describe("targetFormat decision matrix (opencode-go, real functions)", () => {
   const providerDefault = "openai"; // opencode-go provider format
 
   const cases = [
@@ -82,9 +133,12 @@ describe("targetFormat decision matrix", () => {
 
   for (const { client, model, expected } of cases) {
     it(`${client ?? "generic"} → ${model} resolves targetFormat=${expected}`, () => {
-      const preferred = getClientPreferredFormat(client);
-      const supported = getModelSupportedFormats(OC_GO, model);
-      const targetFormat = resolveTargetFormat(preferred, supported, null, providerDefault);
+      const targetFormat = resolveTargetFormat({
+        preferredFormat: getClientPreferredFormat(client),
+        supportedFormats: getModelSupportedFormats(OC_GO, model),
+        modelTargetFormat: null, // opencode-go models no longer carry targetFormat
+        providerDefault,
+      });
       expect(targetFormat).toBe(expected);
     });
   }
@@ -127,5 +181,37 @@ describe("OpenCodeGoExecutor endpoint selection by targetFormat", () => {
     const h = exec.buildHeaders({ apiKey: "sk-test" });
     expect(h["Authorization"]).toBe("Bearer sk-test");
     expect(h["x-api-key"]).toBeUndefined();
+  });
+});
+
+// Integration: verify the FULL chain execute() → this._targetFormat → buildUrl → fetch URL.
+// This catches any wiring bug between chatCore passing targetFormat and the
+// executor actually selecting the endpoint.
+describe("OpenCodeGoExecutor.execute → endpoint (integration, mocked fetch)", () => {
+  const exec = new OpenCodeGoExecutor();
+  const baseArgs = { body: { messages: [] }, stream: false, credentials: { apiKey: "sk-test" }, log: {} };
+
+  beforeEach(() => proxyAwareFetch.mockClear());
+
+  it("forwards claude targetFormat and fetches /messages", async () => {
+    const r = await exec.execute({ ...baseArgs, model: "minimax-m2.7", targetFormat: "claude" });
+    expect(r.url).toBe("https://opencode.ai/zen/go/v1/messages");
+    expect(proxyAwareFetch).toHaveBeenCalledTimes(1);
+    expect(proxyAwareFetch.mock.calls[0][0]).toBe("https://opencode.ai/zen/go/v1/messages");
+  });
+
+  it("forwards openai-responses targetFormat and fetches /responses", async () => {
+    const r = await exec.execute({ ...baseArgs, model: "deepseek-v4-pro", targetFormat: "openai-responses" });
+    expect(r.url).toBe("https://opencode.ai/zen/go/v1/responses");
+  });
+
+  it("forwards openai targetFormat and fetches /chat/completions", async () => {
+    const r = await exec.execute({ ...baseArgs, model: "kimi-k2.6", targetFormat: "openai" });
+    expect(r.url).toBe("https://opencode.ai/zen/go/v1/chat/completions");
+  });
+
+  it("omits targetFormat → falls back to /chat/completions (backward-compatible)", async () => {
+    const r = await exec.execute({ ...baseArgs, model: "kimi-k2.6" });
+    expect(r.url).toBe("https://opencode.ai/zen/go/v1/chat/completions");
   });
 });

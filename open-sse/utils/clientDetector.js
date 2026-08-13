@@ -76,3 +76,24 @@ export function getClientPreferredFormat(clientTool) {
   if (!clientTool) return null;
   return CLIENT_PREFERRED_FORMAT[clientTool] || null;
 }
+
+/**
+ * Resolve the upstream target format for a request.
+ *
+ * Prefers the client's native format when the model declares support for it
+ * (supportedFormats); otherwise falls back to the model/provider default.
+ * Soft-preference: a miss is silent and never errors.
+ *
+ * @param {object} opts
+ * @param {string|null} opts.preferredFormat   - client's preferred format
+ * @param {string[]|null} opts.supportedFormats - model's declared formats
+ * @param {string|null} opts.modelTargetFormat  - model-level default
+ * @param {string} opts.providerDefault         - provider-level default
+ * @returns {string} resolved target format
+ */
+export function resolveTargetFormat({ preferredFormat, supportedFormats, modelTargetFormat, providerDefault }) {
+  if (preferredFormat && supportedFormats?.includes(preferredFormat)) {
+    return preferredFormat;
+  }
+  return modelTargetFormat || providerDefault;
+}

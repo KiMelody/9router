@@ -15,7 +15,7 @@ import { buildRequestDetail, extractRequestConfig } from "./chatCore/requestDeta
 import { handleForcedSSEToJson } from "./chatCore/sseToJsonHandler.js";
 import { handleNonStreamingResponse } from "./chatCore/nonStreamingHandler.js";
 import { handleStreamingResponse, buildOnStreamComplete } from "./chatCore/streamingHandler.js";
-import { detectClientTool, isNativePassthrough, getClientPreferredFormat } from "../utils/clientDetector.js";
+import { detectClientTool, isNativePassthrough, getClientPreferredFormat, resolveTargetFormat } from "../utils/clientDetector.js";
 import { injectCaveman } from "../rtk/caveman.js";
 import { compressMessages, formatRtkLog } from "../rtk/index.js";
 
@@ -40,17 +40,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (bypassResponse) return bypassResponse;
 
   const alias = PROVIDER_ID_TO_ALIAS[provider] || provider;
-  const modelTargetFormat = getModelTargetFormat(alias, model);
   // Route to the client's preferred native format when the model declares support
   // for it; otherwise fall back to the model/provider default (soft-preference).
-  const modelSupportedFormats = getModelSupportedFormats(alias, model);
-  const preferredFormat = getClientPreferredFormat(clientTool);
-  let targetFormat;
-  if (preferredFormat && modelSupportedFormats?.includes(preferredFormat)) {
-    targetFormat = preferredFormat;
-  } else {
-    targetFormat = modelTargetFormat || getTargetFormat(provider);
-  }
+  const targetFormat = resolveTargetFormat({
+    preferredFormat: getClientPreferredFormat(clientTool),
+    supportedFormats: getModelSupportedFormats(alias, model),
+    modelTargetFormat: getModelTargetFormat(alias, model),
+    providerDefault: getTargetFormat(provider),
+  });
   const stripList = getModelStrip(alias, model);
 
   // Inject provider-level thinking config override (only if client hasn't set)
