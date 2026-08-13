@@ -95,7 +95,10 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, targetFormat = null }) {
+    // Cache targetFormat so subclass buildUrl/buildHeaders can pick the endpoint
+    // matching the resolved upstream format (e.g. claude → /messages).
+    this._targetFormat = targetFormat;
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;

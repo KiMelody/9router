@@ -58,3 +58,21 @@ export function isNativePassthrough(clientTool, provider) {
     : provider;
   return nativeProviders.includes(normalizedProvider);
 }
+
+// Preferred upstream format per CLI client. When a model declares support for
+// this format (supportedFormats in providerModels), the request is routed to
+// the matching native endpoint to avoid lossy double-hop translation.
+const CLIENT_PREFERRED_FORMAT = {
+  claude: "claude",                 // Claude Code → Anthropic /messages
+  codex: "openai-responses",        // Codex CLI → OpenAI Responses /responses
+};
+
+/**
+ * Get the client's preferred upstream format, if any.
+ * @param {string|null} clientTool - Result of detectClientTool()
+ * @returns {string|null} e.g. "claude" | "openai-responses"
+ */
+export function getClientPreferredFormat(clientTool) {
+  if (!clientTool) return null;
+  return CLIENT_PREFERRED_FORMAT[clientTool] || null;
+}
