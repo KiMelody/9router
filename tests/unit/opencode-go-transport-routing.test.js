@@ -13,6 +13,9 @@
 //     is bypassed on master (suffix isn't stripped before the registry lookup) and these get
 //     routed to /messages, which the upstream does not serve for them.
 //   - minimax + (max) + claude — suffix must NOT block a genuinely declared format.
+//   - wire-shape cells: assert the body handed to the executor (post prepareClaudeRequest)
+//     carries the unsigned thinking placeholder on the /messages passthrough — the offline
+//     stand-in for the #4436 live replay until one runs on a real go-lane account.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const { executeMock } = vi.hoisted(() => ({
@@ -171,5 +174,74 @@ describe("opencode-go thinking-suffix guard (regression)", () => {
     const { result, runtimeTransport } = await route("minimax-m3(max)", "openai-responses");
     expect(result.success).toBe(true);
     expect(runtimeTransport).toBeNull();
+  });
+});
+// Wire-shape cells for the #4436 thinking injection: the body captured at executor.execute
+// is the translatedBody that prepareClaudeRequest produced — the last translation-layer
+// artifact before dispatch, i.e. what a live /messages replay would put on the wire.
+async function runClaude(body, model) {
+  executeMock.mockResolvedValueOnce({
+    response: new Response(JSON.stringify(RESPONSE_BY_FORMAT.claude), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    url: ENDPOINTS.claude,
+    headers: {},
+    transformedBody: null,
+  });
+
+  const result = await handleChatCore({
+    body: { ...body, model: `opencode-go/${model}`, stream: false },
+    modelInfo: { provider: "opencode-go", model },
+    credentials: { apiKey: "test-key", providerSpecificData: {} },
+    connectionId: "ocg-inject-test",
+    sourceFormatOverride: "claude",
+    log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+  });
+
+  const call = executeMock.mock.calls.at(-1)[0];
+  return { result, wireBody: call.body, runtimeTransport: call.credentials.runtimeTransport ?? null };
+}
+
+const THINKING_TOOL_LOOP = {
+  max_tokens: 2048,
+  thinking: { type: "enabled", budget_tokens: 1024 },
+  messages: [
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "toolu_1", name: "get_weather", input: { city: "Paris" } }],
+    },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "18C" }] },
+  ],
+};
+
+function assistantBlocks(wireBody) {
+  const assistant = wireBody.messages.find((m) => m.role === "assistant");
+  return assistant?.content ?? [];
+}
+
+describe("opencode-go DeepSeek thinking injection wire shape (via real handleChatCore)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("puts an unsigned thinking placeholder on the /messages wire body for deepseek-v4-flash(max)", async () => {
+    const { result, wireBody, runtimeTransport } = await runClaude(THINKING_TOOL_LOOP, "deepseek-v4-flash(max)");
+    expect(result.success).toBe(true);
+    expect(runtimeTransport?.baseUrl).toBe(ENDPOINTS.claude); // claude passthrough, no translation detour
+
+    const blocks = assistantBlocks(wireBody);
+    expect(blocks[0]).toEqual({ type: "thinking", thinking: "." }); // unsigned: no signature key
+    expect(blocks.filter((b) => b.type === "tool_use")).toHaveLength(1);
+  });
+
+  it("injects nothing for minimax-m3 on the same /messages passthrough", async () => {
+    const { result, wireBody, runtimeTransport } = await runClaude(THINKING_TOOL_LOOP, "minimax-m3");
+    expect(result.success).toBe(true);
+    expect(runtimeTransport?.baseUrl).toBe(ENDPOINTS.claude);
+
+    const blocks = assistantBlocks(wireBody);
+    expect(blocks).toHaveLength(1); // tool_use only — no placeholder
+    expect(blocks[0].type).toBe("tool_use");
   });
 });
